@@ -3,9 +3,10 @@ Package broadcast provides pubsub of messages over channels.
 
 A provider has a Broadcaster into which it Submits messages and into
 which subscribers Register to pick up those messages.
-
 */
 package broadcast
+
+import "sync"
 
 type broadcaster struct {
 	input chan interface{}
@@ -13,6 +14,10 @@ type broadcaster struct {
 	unreg chan chan<- interface{}
 
 	outputs map[chan<- interface{}]bool
+
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
+	sync.Once // close once
 }
 
 // The Broadcaster interface describes the main entry points to
@@ -32,13 +37,19 @@ type Broadcaster interface {
 
 func (b *broadcaster) broadcast(m interface{}) {
 	for ch := range b.outputs {
-		ch <- m
+		select {
+		case ch <- m:
+		case <-b.stopCh:
+		}
 	}
 }
 
 func (b *broadcaster) run() {
+	defer b.wg.Done()
 	for {
 		select {
+		case <-b.stopCh:
+			return
 		case m := <-b.input:
 			b.broadcast(m)
 		case ch, ok := <-b.reg:
@@ -61,8 +72,10 @@ func NewBroadcaster(buflen int) Broadcaster {
 		reg:     make(chan chan<- interface{}),
 		unreg:   make(chan chan<- interface{}),
 		outputs: make(map[chan<- interface{}]bool),
+		stopCh:  make(chan struct{}),
 	}
 
+	b.wg.Add(1)
 	go b.run()
 
 	return b
@@ -77,8 +90,16 @@ func (b *broadcaster) Unregister(newch chan<- interface{}) {
 }
 
 func (b *broadcaster) Close() error {
-	close(b.reg)
-	close(b.unreg)
+	b.Do(func() {
+		close(b.stopCh)
+		b.wg.Wait()
+		close(b.reg)               // not allowed to register anymore.
+		close(b.unreg)             // not allowed to unregister anymore.
+		close(b.input)             // not allowed to submit anymore.
+		for v := range b.outputs { // close all registered channel.
+			close(v)
+		}
+	})
 	return nil
 }
 
